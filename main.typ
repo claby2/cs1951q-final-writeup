@@ -34,6 +34,10 @@ Cranelift uses its own DSL to express both lowering and optimization logic calle
 
 This project specifically aimed to create mid-end optimizations that were missing in Cranelift as pointed out by #link("https://github.com/bytecodealliance/wasmtime/issues/11578")[wasmtime/issues/#11578].
 This issue points out a potential optimization involving `icmp`, `select`, and `brif` IR instructions.
+
+For reference, `icmp` returns 1 if the comparison is true and 0 otherwise. #footnote[The function can also return -1 for vector operations, but that is not in scope for this project.]
+`select` returns the first argument if its condition is truthy (not `0`) and the second argument otherwise.
+
 Specifically, in the following CLIF code:
 
 ```clif
@@ -66,10 +70,108 @@ Crucially, since we know `v7` is constrained to either be equal to `6` or `7`, w
 
 Moreover, a further optimization may optimize away the branching if (`brif`) instruction by leveraging yet another `select` instead.
 However, while we considered this approach, we chose to focus on the former optimization due to difficulties involving simplifying terminating instructions that may modify the control-flow graph.
-Our attempts are discussed in the Implementation section [TODO: Make sure this is discussed].
+Our attempts are discussed in the Implementation section.
 
 #pagebreak()
 == Implementation
+The implementation of our project was written in ISLE, Cranelift’s DSL for writing optimizations. Let’s introduce ISLE before getting into the specifics of our optimization.
+
+ISLE is a typed DSL compiling to Rust that Cranelift authors use to declaratively express two types of transformations to CLIF: 1) lowering from CLIF to machine code and 2) CLIF optimizations. ISLE consists of _rules_ that can be thought of as pattern matching. For example, the ISLE used to transform a CLIF `iadd` and `imul` instruction group to `aarch64` machine code might look like: @fallin2023cranelift
+
+```isle
+(iadd (imul a b) c) => (aarch64_madd a b c)
+```
+
+At a high level, the above ISLE DSL would compile down to the following pseudocode.
+```
+$t0, $t1 := match_op $root, iadd
+$t2, $t3 := match_op $t0, imul
+$t4 = create_op aarch64_madd, $t2, $t3, $t1
+return $t4
+```
+
+A unique technique ISLE explores is making the DSL strongly-typed. Some example types are IR `Value`s and architecture-specific `Reg`s that correspond to Rust types. ISLE benefits from common type system wins like preserving invariants via types: tracking “flag” registers in architecture-specific code happens with `ProducesFlags` and `ConsumesFlags` typed values.
+
+Our implementation consists of ISLE code. At a high level, we target `icmp eq` (equals comparison) or `icmp ne` (not equals comparison) instructions. Let’s use the example `icmp eq, x, k1`, where `x` is any value and `k1` is a known constant value.
+If we see the value of `x` comes from the instruction `select y, k1, k2`, we know that these two instructions together are equivalent to the “inner_cond” (i.e. the condition of the select instruction).
+A key constraint for our optimization is checking `k1 != k2`: `select y, k1, k1` will be optimized by constant propagation.
+
+Along the way, we ran into challenges with `brif`, isomorphic `icmp` instances, and handling non-boolean `select` conditions.
+
+=== The brif Instruction
+
+In CLIF, the `brif` instruction jumps to one of two basic blocks depending on a condition value. The original issue report includes a reproducible test case where the final optimization may affect a brif instruction by swapping the order of the target basic blocks based on the structure of the select and icmp. Our first idea was to target the brif instruction in ISLE as the target instruction pattern for our optimization. However, looking at the Rust implementation that our potential ISLE code interacts with, we see a comment explaining that ISLE cannot optimize terminators like `brif`.
+
+#figure(image("brif_broken.png"), caption: [
+  Code snippet showing restrictions on ISLE simplifying terminators.
+])
+
+Further details can be found in the corresponding code comments @wasmtime_egraph_2025.
+We solved this challenge by generalizing to optimize the condition passed to brif.
+We noticed that any condition that follows the `icmp` + `select` pattern described above may be subject to our optimization: the `brif` instruction is not a required pattern-match condition.
+Our resulting optimization targets `icmp` on the result of a `select` to simplify to a boolean value without modifying control flow.
+
+=== Isomorphic icmp Instances
+
+In our examples above, our instruction to optimize was an `icmp eq` with `k1` as the condition.
+However, `icmp eq` with `k2` and `icmp ne` with `k1` are similar setups where the optimization can also apply.
+In total, we want to tackle `icmp (eq | ne), x, (k1 | k2)` for a total of four cases.
+Following careful casework, we determined `icmp eq, x, k2` and `icmp ne, x, k1` simplify to the _negation_ of the corresponding select instruction’s condition.
+A naive approach is to insert a `bxor 1` to invert the result.
+Instead of using `bxor`, we can handle both negation and boolean casting simultaneously by strictly comparing the inner condition against 0. We explain this technique in the next section.
+
+=== Handling Non-boolean selects
+
+CLIF has the concept of “truthiness” where 0 is `false` and anything else is `true`.
+Thus, a naive optimization of replacing the `icmp` + `select` combo with the `select`’s inner condition fails in cases such as @tricky_test_case when the inner condition is not `0` or `1`.
+
+#figure(
+  ```CLIF
+  function %a(i64) -> i8 {
+  block0(v0: i64):
+    v1 = select v0, 100, 0
+    v2 = icmp_imm eq v1, 100
+    return v2
+  }
+  ```,
+  caption: [
+    Test case that breaks naive optimization.
+    The inner condition is `v0`.
+    Note this is not the exact test case because `icmp_imm` will be legalized before optimization passes run.
+  ],
+) <tricky_test_case>
+
+A naive optimization rewrites this to @naive_try.
+However, this transformation loses the "casting" effect of the `icmp` + `select` instruction combo and results in invalid IR.
+More concretely, the unoptimized `icmp` instruction will “cast” the potentially truthy inner condition of `select` to an `i8` boolean (0 or 1).
+We account for this by inserting an `icmp` against 0, replicating the “cast”.
+This gives us the correct optimization in @correct_optimization.
+
+#figure(
+  ```CLIF
+  function %a(i64) -> i8 {
+  block0(v0: i64):
+    return v0
+  }
+  ```,
+  caption: [Naive optimization results in invalid IR: v0, an `i64`, does not match the return type of `i8`.],
+) <naive_try>
+
+#figure(
+  ```CLIF
+  function %a(i64) -> i8 {
+  block0(v0: i64):
+    v1 = icmp_imm ne v0, 0
+    return v1
+  }
+  ```,
+  caption: [Inserting an `icmp_imm ne .. 0` to "cast" the inner condition of `select` into a boolean.],
+) <correct_optimization>
+
+The end result is eliminating one `select` instruction.
+Additionally, some architectures like x86 have optimizations for comparing against `0` vs. other values. @intel_opt_manual_v1
+However, we have not measured performance impact.
+
 
 #pagebreak()
 == Evaluation
@@ -125,3 +227,5 @@ The guard condition `(if-let false (u64_eq k1 k2))` correctly prevents optimizat
 *Reproducibility details:*
 - Cranelift commit: 32f12567f5aeb79ec733b9dc9d8f732a5872c73a
 - File location: `cranelift/codegen/src/opts/icmp.isle:379-412`
+
+#bibliography("works.bib")
