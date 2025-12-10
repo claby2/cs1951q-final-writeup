@@ -11,7 +11,14 @@
 
 == Summary
 
-We implemented a missing optimization in Cranelift, Wasmtime's compiler backend, targeting a specific pattern involving `icmp`, `select`, and `brif` IR instructions. Our optimization eliminates redundant intermediate instructions when a `select` instruction with constant operands is immediately compared against one of those constants, reducing the pattern from 5 instructions to 1. Using Cranelift's ISLE DSL, we developed four rewrite rules handling equality/inequality comparisons with different constant orderings, while addressing challenges including terminator instruction restrictions, boolean casting requirements, and isomorphic comparison cases. Our comprehensive testing methodology combining semantic verification, FileCheck transformations, and boundary condition analysis ensured correctness across all variants. Though we demonstrated successful IR reduction and maintained semantic correctness without breaking existing optimizations, the real-world performance impact remains unmeasured due to lack of frequency analysis on practical codebases and runtime benchmarks.
+Modern WebAssembly runtimes reply on optimizing compilers to generate efficient machine code. In this work, we implemented a previously missing optimization in Cranelift, Wasmtime's compiler backend, that simplifies a redundant `select + icmp` instruction pattern in its intermediate representation. Specifically, when a `select` instruction with constant operands is immediately compared against those constants, the pattern can be collapsed into a single boolean operation. Using Cranelift's ISLE domain-specific langauge, we introduce four new rewrite rules that handle equality and inequality comparisons and all constant orderings. Key challenges included ISLE's restriction on terminator instruction simplification, explicit boolean type requirements, and managing isomorphic pattern variations. The resulting solution preserves full semantic correctness, has been validated through comprehensive testing, and is now integrated upstream in Wasmtime.
+
+#v(2em)
+
+#figure(image("peng.png", width: 75%), caption: [
+  WebAssembly compilation pipeline through Wasmtime showing the optimization target: WASM bytecode is processed by Wasmtime runtime, compiled to Cranelift IR, optimized in ISLE, and lowered to machine code.
+])
+
 
 #pagebreak()
 == Introduction
