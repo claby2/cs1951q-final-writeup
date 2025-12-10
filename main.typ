@@ -32,7 +32,10 @@ block0(v0: i64):
 
 It is interesting to note that this textual form, known as CLIF, is primarily used for testing/debugging purposes. The actual IR used by Wasmtime is represented as an in-memory data structure. Cranelift's goal is to transform this IR into fast, architecture-dependent machine code. Doing so often requires IR-level mid-end optimization passes.
 
-Cranelift uses its own DSL to express both lowering and optimization logic called ISLE (Instruction Selection Lowering Expressions). For this project specifically, we focused on mid-end optimizations, meaning producing expressions that take Cranelift IR and produces (optimized) Cranelift IR rather than machine code.
+Cranelift uses a DSL called ISLE (Instruction Selection Lowering Expressions) to express both lowering and optimization logic.
+ISLE consists of _rules_ that can be thought of as pattern matching.
+A unique feature of ISLE is that it is type-aware. Example types are IR `Value`s and architecture-specific `Reg`s that correspond to Rust types. ISLE benefits from common type system wins like preserving invariants via types: tracking “flag” registers in architecture-specific code happens with `ProducesFlags` and `ConsumesFlags` typed values.
+For this project, we focused on mid-end optimizations that take as input Cranelift IR and produces (optimized) Cranelift IR (rather than machine code).
 
 This project specifically aimed to create mid-end optimizations that were missing in Cranelift as pointed out by #link("https://github.com/bytecodealliance/wasmtime/issues/11578")[wasmtime/issues/#11578].
 This issue points out a potential optimization involving `icmp`, `select`, and `brif` IR instructions.
@@ -76,56 +79,38 @@ Our attempts are discussed in the Implementation section.
 
 #pagebreak()
 == Implementation
-The implementation of our project was written in ISLE, Cranelift’s DSL for writing optimizations. Let’s introduce ISLE before getting into the specifics of our optimization.
 
-ISLE is a typed DSL compiling to Rust that Cranelift authors use to declaratively express two types of transformations to CLIF: 1) lowering from CLIF to machine code and 2) CLIF optimizations. ISLE consists of _rules_ that can be thought of as pattern matching. For example, the ISLE used to transform a CLIF `iadd` and `imul` instruction group to `aarch64` machine code might look like: @fallin2023cranelift
+Our implementation consists of ISLE code. At a high level, we target `icmp eq` (equals comparison) and `icmp ne` (not equals comparison) instructions. We consider the instruction `icmp eq, x, k1`, where `x` is any `Value` and `k1` is a known constant value.
+If we see the value of `x` comes from the instruction `select y, k1, k2`, we know that these two instructions together are equivalent to the inner condition `y`.
+That is, `icmp eq, x, k1` is completely determined by `y`, meaning we can avoid a redundant `select`.
+However, this is only true if `k1 != k2` because otherwise an instruction like `select y, k1, k1` would be optimized by constant propagation.
 
-```isle
-(iadd (imul a b) c) => (aarch64_madd a b c)
-```
+Prior to reaching the aforementioned implementation, we ran into challenges involving optimizations on `brif`, handling non-boolean `select` inner conditions, and dealing with similar `icmp` setups.
 
-At a high level, the above ISLE DSL would compile down to the following pseudocode.
-```
-$t0, $t1 := match_op $root, iadd
-$t2, $t3 := match_op $t0, imul
-$t4 = create_op aarch64_madd, $t2, $t3, $t1
-return $t4
-```
+=== Challenge 1: The brif Instruction
 
-A unique technique ISLE explores is making the DSL strongly-typed. Some example types are IR `Value`s and architecture-specific `Reg`s that correspond to Rust types. ISLE benefits from common type system wins like preserving invariants via types: tracking “flag” registers in architecture-specific code happens with `ProducesFlags` and `ConsumesFlags` typed values.
-
-Our implementation consists of ISLE code. At a high level, we target `icmp eq` (equals comparison) or `icmp ne` (not equals comparison) instructions. Let’s use the example `icmp eq, x, k1`, where `x` is any value and `k1` is a known constant value.
-If we see the value of `x` comes from the instruction `select y, k1, k2`, we know that these two instructions together are equivalent to the “inner_cond” (i.e. the condition of the select instruction).
-A key constraint for our optimization is checking `k1 != k2`: `select y, k1, k1` will be optimized by constant propagation.
-
-Along the way, we ran into challenges with `brif`, isomorphic `icmp` instances, and handling non-boolean `select` conditions.
-
-=== The brif Instruction
-
-In CLIF, the `brif` instruction jumps to one of two basic blocks depending on a condition value. The original issue report includes a reproducible test case where the final optimization may affect a brif instruction by swapping the order of the target basic blocks based on the structure of the select and icmp. Our first idea was to target the brif instruction in ISLE as the target instruction pattern for our optimization. However, looking at the Rust implementation that our potential ISLE code interacts with, we see a comment explaining that ISLE cannot optimize terminators like `brif`.
+In CLIF, the `brif` instruction jumps to one of two basic blocks depending on a condition value. The original issue report includes a reproducible test case where the final optimization may affect a `brif` instruction by swapping the order of the target basic blocks based on the structure of the `select` and `icmp`. Our first idea was to target the `brif` instruction in ISLE as the instruction pattern for our optimization.
+That is, we would find `brif` instructions that are conditioned on `icmp` + `select` instructions and coalesce the blocks into simpler instructions.
+However, we found that the simplify rules we wrote on `brif` did not propogate through.
+After some debugging, we discovered the following limitation in the ISLE source code:
 
 #figure(image("brif_broken.png"), caption: [
   Code snippet showing restrictions on ISLE simplifying terminators.
 ])
 
 Further details can be found in the corresponding code comments @wasmtime_egraph_2025.
-We solved this challenge by generalizing to optimize the condition passed to brif.
+In summary, it is difficult to simplify terminating instructions (such as `brif`) because they modify the control-flow graph.
+Modifying the control-flow graph introduces a host of problems.
+For example, it may change the domination relation between blocks, which may in turn invalidate uses of some variables.
+
+Hence, we avoided optimizations on `brif`.
 We noticed that any condition that follows the `icmp` + `select` pattern described above may be subject to our optimization: the `brif` instruction is not a required pattern-match condition.
 Our resulting optimization targets `icmp` on the result of a `select` to simplify to a boolean value without modifying control flow.
 
-=== Isomorphic icmp Instances
+=== Challenge 2: Handling Non-Boolean `select` Inner Conditions
 
-In our examples above, our instruction to optimize was an `icmp eq` with `k1` as the condition.
-However, `icmp eq` with `k2` and `icmp ne` with `k1` are similar setups where the optimization can also apply.
-In total, we want to tackle `icmp (eq | ne), x, (k1 | k2)` for a total of four cases.
-Following careful casework, we determined `icmp eq, x, k2` and `icmp ne, x, k1` simplify to the _negation_ of the corresponding select instruction’s condition.
-A naive approach is to insert a `bxor 1` to invert the result.
-Instead of using `bxor`, we can handle both negation and boolean casting simultaneously by strictly comparing the inner condition against 0. We explain this technique in the next section.
-
-=== Handling Non-boolean selects
-
-CLIF has the concept of “truthiness” where 0 is `false` and anything else is `true`.
-Thus, a naive optimization of replacing the `icmp` + `select` combo with the `select`’s inner condition fails in cases such as @tricky_test_case when the inner condition is not `0` or `1`.
+CLIF's `icmp` instruction has the concept of “truthiness” where 0 is false and anything else is true.
+Thus, a naive optimization of replacing the `icmp` + `select` combo with the `select`’s inner condition fails in cases such as @tricky_test_case when the inner condition can be any value, not just `0` or `1`.
 
 #figure(
   ```CLIF
@@ -138,8 +123,7 @@ Thus, a naive optimization of replacing the `icmp` + `select` combo with the `se
   ```,
   caption: [
     Test case that breaks naive optimization.
-    The inner condition is `v0`.
-    Note this is not the exact test case because `icmp_imm` will be legalized before optimization passes run.
+    The inner condition is `v0` which can be any 64-bit integer.
   ],
 ) <tricky_test_case>
 
@@ -170,9 +154,45 @@ This gives us the correct optimization in @correct_optimization.
   caption: [Inserting an `icmp_imm ne .. 0` to "cast" the inner condition of `select` into a boolean.],
 ) <correct_optimization>
 
-The end result is eliminating one `select` instruction.
-Additionally, some architectures like x86 have optimizations for comparing against `0` vs. other values. @intel_opt_manual_v1
-However, we have not measured performance impact.
+
+=== Challenge 3: Similar `icmp` Setups
+
+Our first intuition was to focus on matching on instructions of the form `icmp eq, x, k1` where `x = select y, k1, k2`.
+
+However, we quickly noticed that we can apply similar optimizations on
+- `icmp eq, x, k2`: which compares `x` with `k2` instead of `k1`.
+- `icmp ne, x, k1`: which uses `ne` instead of `eq`.
+- `icmp ne, x, k2`: which uses `ne` instead of `eq` _and_ compares `x` with `k2` instead of `k1`.
+
+Following careful casework, we determined `icmp eq, x, k2` and `x = icmp ne, y, k1` simplify to the _negation_ of the corresponding `select` instruction’s condition.
+
+
+=== Simplify Rules
+
+In the end, we produced four simplifying rewrite rules to Cranelift.
+One of the four is listed below:
+
+#figure(
+  ```ISLE
+  (rule (simplify (eq _
+    (select select_ty inner_cond
+      (iconst_u _ k1)
+      (iconst_u _ k2))
+    (iconst_u _ k1)))
+    (if-let false (u64_eq k1 k2))
+    (ne select_ty inner_cond (iconst_u select_ty 0)))
+  ```,
+  caption: [One of the four simplifying rewrite rules we introduced written in ISLE.],
+) <simplify_rewrite>
+
+Firstly, @simplify_rewrite matches on instructions of the form `icmp eq, x, k1` where `x = select y, k1, k2`.
+Then, the `if-let` check ensures that `k1 != k2`.
+Finally, it replaces it with `icmp ne, y, 0`, avoiding a `select` instruction.
+
+// TODO: EVALUATION:
+// The end result is eliminating one `select` instruction.
+// Additionally, some architectures like x86 have optimizations for comparing against `0` vs. other values. @intel_opt_manual_v1
+// However, we have not measured performance impact.
 
 
 #pagebreak()
