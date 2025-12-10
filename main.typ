@@ -189,29 +189,29 @@ What we do not claim is that this makes real programs faster. We have no data on
 
 We wrote comprehensive tests with two key insights:
 
-1. *Semantic testing was critical*: FileCheck tests only verify IR transformations, but semantic tests (`test run`) caught logical errors in the boolean algebra. For example:
+1. Semantic testing was critical: FileCheck tests only verify IR transformations, but semantic tests (`test run`) caught logical errors in the boolean algebra. For example:
   ```clif
   ; select(false, 6, 7) = 7, icmp(7, 6) = false
   ; Our rule: eq(select(cond, k1, k2), k1) -> ne(cond, 0)
   ; Verification: ne(false, 0) = false
   ```
 
-2. *Boundary condition discovery*: The `%non_icmp_inner` test revealed our optimization works beyond the original motivating case---it handles any boolean condition, not just `icmp` results. This was accidental but valuable.
+2. Boundary condition discovery: The `%non_icmp_inner` test revealed our optimization works beyond the original motivating case---it handles any boolean condition, not just `icmp` results. This was accidental but valuable.
 
-*Edge Case Handling*
+=== Edge Case Handling
 
 The guard condition `(if-let false (u64_eq k1 k2))` correctly prevents optimization when both constants are identical, allowing constant propagation to handle `select(cond, k, k)` -> `k`.
 
 === What The Numbers Mean (And Don't Mean)
 
-*IR Instruction Count Results:*
+The following are the summarized IR instruction count results:
 - Pattern occurrence: 5 instructions -> 1 instruction (5:1 reduction)
 - Test coverage: 100% of target patterns optimized
 - False positives: 0% (no incorrect transformations)
 
-*Why instruction count is a limited metric:* Modern CPUs are complex. Out-of-order execution, register renaming, and aggressive speculation may already hide the inefficiencies we're targeting. Additionally, `select` instructions have varying costs across architectures being cheap on some, expensive on others.
+Although this initially seems promising, instruction count might be limited metric. Modern CPUs are complex. Out-of-order execution, register renaming, and aggressive speculation may already hide the inefficiencies we're targeting. Additionally, `select` instructions have varying costs across architectures being cheap on some, expensive on others.
 
-*Missing critical data:*
+Missing critical data:
 - How often does this pattern appear in real code?
 - What's the actual runtime performance impact?
 - Does the optimization increase compile time noticeably?
