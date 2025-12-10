@@ -189,16 +189,34 @@ What we do not claim is that this makes real programs faster. We have no data on
 
 === Test Results and Validation
 
-We wrote comprehensive tests with two key insights:
+Our testing approach revealed that compiler optimizations require validation at two distinct levels, both of which are equally important.
 
-1. Semantic testing was critical: FileCheck tests only verify IR transformations, but semantic tests (`test run`) caught logical errors in the boolean algebra. For example:
-  ```clif
-  ; select(false, 6, 7) = 7, icmp(7, 6) = false
-  ; Our rule: eq(select(cond, k1, k2), k1) -> ne(cond, 0)
-  ; Verification: ne(false, 0) = false
-  ```
+First, syntactic correctness testing through `test optimize` and FileCheck verifies the IR transformation happens as expected. The optimization fires, removes the select/icmp instructions, and produces syntactically valid IR.
 
-2. Boundary condition discovery: The `%non_icmp_inner` test revealed our optimization works beyond the original motivating case---it handles any boolean condition, not just `icmp` results. This was accidental but valuable.
+Second, semantic correctness testing through `test run` verifies the transformed code actually computes the same results as the original.
+
+Both layers are essential because you can have optimizations that pass all FileCheck tests but produce wrong answers. Consider if we had botched the boolean logic:
+```clif
+; WRONG transformation: eq(select(cond, k1, k2), k1) → eq(cond, 0)
+; RIGHT transformation: eq(select(cond, k1, k2), k1) → ne(cond, 0)
+```
+
+FileCheck would see both as "successful"—the select and icmp disappear, replaced by a direct comparison. But only semantic testing reveals that the wrong transformation returns inverted results.
+
+A concrete example from our tests demonstrates this:
+```clif
+function %non_icmp_inner(i64) -> i8 {
+    v4 = select v0, 6, 7    ; if v0 then 6 else 7
+    v5 = icmp eq v4, 6      ; is result == 6?
+    return v5
+}
+; run: %non_icmp_inner(0) == 0  ; select(0,6,7)=7, eq(7,6)=0
+; run: %non_icmp_inner(1) == 1  ; select(1,6,7)=6, eq(6,6)=1
+```
+
+The `test run` directives catch boolean logic errors that FileCheck cannot. If our transformation was wrong, we'd get `%non_icmp_inner(0) == 1` instead of `0`, exposing the bug.
+
+The `%non_icmp_inner` test also revealed our optimization works beyond the original `icmp + select + icmp` pattern—it handles any boolean condition. This was discovered through semantic testing, not IR inspection.
 
 === Edge Case Handling
 
