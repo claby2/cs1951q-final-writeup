@@ -193,9 +193,6 @@ Finally, it replaces it with `icmp ne, y, 0`, avoiding a `select` instruction.
 
 // TODO: EVALUATION:
 // The end result is eliminating one `select` instruction.
-// Additionally, some architectures like x86 have optimizations for comparing against `0` vs. other values. @intel_opt_manual_v1
-// However, we have not measured performance impact.
-
 
 #pagebreak()
 == Evaluation
@@ -271,6 +268,10 @@ The following example is an optimization correctness test:
 ) <optimization_correctness_test>
 
 This test simply ensures that the optimized IR matches the expected output after applying our optimization.
+
+Some architectures like x86 have optimizations for comparing against `0` vs. other values. @intel_opt_manual_v1
+However, we have not measured performance impact.
+
 
 === Result
 
