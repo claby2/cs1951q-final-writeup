@@ -7,6 +7,7 @@
 ])
 
 #show link: underline
+#set quote(block: true)
 
 == Summary
 
@@ -275,7 +276,18 @@ This test simply ensures that the optimized IR matches the expected output after
 
 We submitted a pull request to the Wasmtime codebase which can be viewed at #link("https://github.com/bytecodealliance/wasmtime/pull/12135")[wasmtime/pull/#12135].
 The pull request passed all CI checks and was eventually merged into the main codebase.
-As a result, the original issue #link("https://github.com/bytecodealliance/wasmtime/pull/12135")[wasmtime/issues/#11578] was closed.
+As a result, the original issue #link("https://github.com/bytecodealliance/wasmtime/issues/11578")[wasmtime/issues/#11578] was closed.
+
+=== Future Work
+
+While our optimization successfully reduces IR size via removing redundant `select` instructions, we left out an additional optimization involving `brif` instructions due to the challenges discussed earlier.
+
+Future work may involve overcoming the challenges of modifying control-flow graph altering instructions in ISLE.
+This may involve deeper changes as discussed in the #link("https://github.com/bytecodealliance/wasmtime/issues/11578")[original issue] thread.
+
+#quote(attribution: [cfallin])[
+  This one is considerably harder: it requires support for seeing through blockparams during mid-end opts, which has very subtle interactions with the single-pass acyclic nature of our rewrite system; and it requires editing the control-flow graph, which also has complex interactions with the way that the rewrite pass works. At some point we'd like to support this, but it would require pretty deep investment from core Cranelift folks to think it through.
+]
 
 #pagebreak()
 #bibliography("works.bib")
