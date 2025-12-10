@@ -165,6 +165,7 @@ However, we quickly noticed that we can apply similar optimizations on
 - `icmp ne, x, k2`: which uses `ne` instead of `eq` _and_ compares `x` with `k2` instead of `k1`.
 
 Following careful casework, we determined `icmp eq, x, k2` and `x = icmp ne, y, k1` simplify to the _negation_ of the corresponding `select` instruction’s condition.
+We noted that constant propagation automatically pushes constant terms leftwards, meaning analogous cases such as `icmp eq, k1, x` etc. (with `k1` on the left-hand side) are automatically captured.
 
 
 === Simplify Rules
