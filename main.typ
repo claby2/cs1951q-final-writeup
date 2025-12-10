@@ -199,74 +199,83 @@ Finally, it replaces it with `icmp ne, y, 0`, avoiding a `select` instruction.
 #pagebreak()
 == Evaluation
 
-We implemented four ISLE rewrite rules that optimize a specific IR pattern in Cranelift: when a `select` instruction with constant operands is immediately compared against one of those constants. The optimization eliminates the intermediate select and comparison, directly using the select's condition.
 
-Our concrete claims are:
-- Reduces IR instruction count for the targeted pattern
-- Maintains semantic correctness across all variants (equality/inequality, different constant orderings)
-- Integrates without breaking existing optimizations
-
-What we do not claim is that this makes real programs faster. We have no data on how often this pattern occurs in practice or whether the optimization provides measurable performance benefits.
+Overall, we implemented four simplifying rewrite rules that optimized `select` + `brif`.
+To ensure our rules do not break existing optimizations, we developed additional tests that ensure our optimizations propagate correctly and also do not change program semantics.
 
 === Test Results and Validation
 
-Our testing approach revealed that compiler optimizations require validation at two distinct levels, both of which are equally important.
+We leverage two types of tests:
+1. Semantic preservation: we wrote tests that evaluated the optimized and non-optimized versions of functions to ensure they returned the same results.
+2. Optimization correctness: we used snapshot testing to ensure our optimization produces the expected IR transformations.
 
-First, syntactic correctness testing through `test optimize` and FileCheck verifies the IR transformation happens as expected. The optimization fires, removes the select/icmp instructions, and produces syntactically valid IR.
+While looking through the Cranelift codebase, we were surprised to see that many existing optimizations are only tested via snapshot testing.
+We wanted to ensure our changes do not introduce silent bugs, so we were motivated to include semantic preservation tests prior to implementing our optimization.
 
-Second, semantic correctness testing through `test run` verifies the transformed code actually computes the same results as the original.
+For example, the following is a semantic preservation test we wrote:
 
-Both layers are essential because you can have optimizations that pass all FileCheck tests but produce wrong answers. Consider if we had botched the boolean logic:
-```clif
-; WRONG transformation: eq(select(cond, k1, k2), k1) → eq(cond, 0)
-; RIGHT transformation: eq(select(cond, k1, k2), k1) → ne(cond, 0)
-```
+#figure(
+  ```CLIF
+  test interpret
+  test run
+  set opt_level=none
+  target x86_64
+  target aarch64
+  set opt_level=speed
 
-FileCheck would see both as "successful"—the select and icmp disappear, replaced by a direct comparison. But only semantic testing reveals that the wrong transformation returns inverted results.
+  function %non_icmp_inner(i64) -> i8 {
+  block0(v0: i64):
+      v1 = iconst.i64 6
+      v3 = iconst.i64 7
+      v4 = select v0, v1, v3
+      v5 = icmp eq v4, v1
+      return v5
+  }
 
-A concrete example from our tests demonstrates this:
-```clif
-function %non_icmp_inner(i64) -> i8 {
-    v4 = select v0, 6, 7    ; if v0 then 6 else 7
-    v5 = icmp eq v4, 6      ; is result == 6?
-    return v5
-}
-; run: %non_icmp_inner(0) == 0  ; select(0,6,7)=7, eq(7,6)=0
-; run: %non_icmp_inner(1) == 1  ; select(1,6,7)=6, eq(6,6)=1
-```
+  ; run: %non_icmp_inner(0) == 0
+  ; run: %non_icmp_inner(1) == 1
+  ; run: %non_icmp_inner(5) == 1
+  ```,
+  caption: [
+    Semantic preservation test that runs the function
+  ],
+) <non_icmp_inner_test>
 
-The `test run` directives catch boolean logic errors that FileCheck cannot. If our transformation was wrong, we'd get `%non_icmp_inner(0) == 1` instead of `0`, exposing the bug.
+This test is run twice, once with optimizations disabled and once with optimizations enabled.
+The `run` directives ensure that both versions of the function return the same results for various inputs.
 
-The `%non_icmp_inner` test also revealed our optimization works beyond the original `icmp + select + icmp` pattern—it handles any boolean condition. This was discovered through semantic testing, not IR inspection.
+The following example is an optimization correctness test:
 
-=== Edge Case Handling
+#figure(
+  ```CLIF
+  function %a(i64) -> i8 {
+  block0(v0: i64):
+      v1 = iconst.i64 6
+      v3 = iconst.i64 7
+      v4 = select v0, v1, v3
+      v5 = icmp eq v4, v1
+      return v5
+  }
 
-The guard condition `(if-let false (u64_eq k1 k2))` correctly prevents optimization when both constants are identical, allowing constant propagation to handle `select(cond, k, k)` -> `k`.
+  ; check: function %a(i64) -> i8 fast {
+  ; check: block0(v0: i64):
+  ; nextln:     v6 = iconst.i64 0
+  ; nextln:     v7 = icmp ne v0, v6  ; v6 = 0
+  ; nextln:     return v7
+  ; nextln: }
+  ```,
+  caption: [
+    Optimization correctness test that checks the optimized IR.
+  ],
+) <optimization_correctness_test>
 
-=== What The Numbers Mean (And Don't Mean)
+This test simply ensures that the optimized IR matches the expected output after applying our optimization.
 
-The following are the summarized IR instruction count results:
-- Pattern occurrence: 5 instructions -> 1 instruction (5:1 reduction)
-- Test coverage: 100% of target patterns optimized
-- False positives: 0% (no incorrect transformations)
+=== Result
 
-Although this initially seems promising, instruction count might be limited metric. Modern CPUs are complex. Out-of-order execution, register renaming, and aggressive speculation may already hide the inefficiencies we're targeting. Additionally, `select` instructions have varying costs across architectures being cheap on some, expensive on others.
+We submitted a pull request to the Wasmtime codebase which can be viewed at #link("https://github.com/bytecodealliance/wasmtime/pull/12135")[wasmtime/pull/#12135].
+The pull request passed all CI checks and was eventually merged into the main codebase.
+As a result, the original issue #link("https://github.com/bytecodealliance/wasmtime/pull/12135")[wasmtime/issues/#11578] was closed.
 
-Missing critical data:
-- How often does this pattern appear in real code?
-- What's the actual runtime performance impact?
-- Does the optimization increase compile time noticeably?
-
-=== Broader Impact Assessment
-
-The optimization consists of only 30 lines of ISLE code, effectively leverages Cranelift's existing infrastructure, and follows established patterns in the codebase. Our comprehensive testing methodology combines semantic verification, FileCheck transformation analysis, and boundary condition testing.
-
-However, the real-world significance of this optimization remains unclear. We lack critical data on pattern frequency in production codebases and runtime performance measurements. The optimization might target a rare IR pattern, or modern hardware with out-of-order execution and register renaming might already mitigate the inefficiencies we address.
-
-Interestingly, our testing methodology discoveries may prove more valuable than the optimization itself. The requirement for semantic testing alongside FileCheck verification, plus the systematic exploration of boundary conditions and optimization interactions, creates a replicable framework for future Cranelift optimization development.
-
-*Reproducibility details:*
-- Cranelift commit: 32f12567f5aeb79ec733b9dc9d8f732a5872c73a
-- File location: `cranelift/codegen/src/opts/icmp.isle:379-412`
-
+#pagebreak()
 #bibliography("works.bib")
