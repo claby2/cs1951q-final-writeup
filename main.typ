@@ -11,12 +11,22 @@
 
 == Summary
 
-Modern WebAssembly runtimes reply on optimizing compilers to generate efficient machine code. In this work, we implemented a previously missing optimization in Cranelift, Wasmtime's compiler backend, that simplifies a redundant `select + icmp` instruction pattern in its intermediate representation. Specifically, when a `select` instruction with constant operands is immediately compared against those constants, the pattern can be collapsed into a single boolean operation. Using Cranelift's ISLE domain-specific langauge, we introduce four new rewrite rules that handle equality and inequality comparisons and all constant orderings. Key challenges included ISLE's restriction on terminator instruction simplification, explicit boolean type requirements, and managing isomorphic pattern variations. The resulting solution preserves full semantic correctness, has been validated through comprehensive testing, and is now integrated upstream in Wasmtime.
+
+For our final project, we implemented a previously missing optimization in Cranelift, Wasmtime's compiler backend, that simplifies a redundant `select + icmp` instruction pattern in its intermediate representation. Specifically, when a `select` instruction with constant operands is immediately compared against those constants, the pattern can be collapsed into a single boolean operation. Using Cranelift's ISLE domain-specific langauge, we introduce four new rewrite rules that handle equality and inequality comparisons and all constant orderings. Key challenges included ISLE's restriction on terminator instruction simplification, explicit boolean type requirements, and managing similar pattern variations. The resulting solution preserves full semantic correctness, has been validated through comprehensive testing, and is now integrated upstream in Wasmtime.
 
 #v(2em)
 
-#figure(image("peng.png", width: 75%), caption: [
-  WebAssembly compilation pipeline through Wasmtime showing the optimization target: WASM bytecode is processed by Wasmtime runtime, compiled to Cranelift IR, optimized in ISLE, and lowered to machine code.
+#figure(
+  image("peng.png", width: 75%),
+  caption: [
+    WebAssembly compilation pipeline through Wasmtime showing the optimization target: WASM bytecode is processed by Wasmtime runtime, compiled to Cranelift IR, optimized in ISLE, and lowered to machine code.
+  ],
+)
+
+#v(2em)
+
+#figure(image("merged.png", width: 75%), caption: [
+  Our optimization was successfully merged into the Wasmtime codebase.
 ])
 
 
